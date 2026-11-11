@@ -1,4 +1,4 @@
-import discord, os, json, threading, urllib.request, xml.etree.ElementTree as ET
+import discord, os, json, threading, urllib.request, xml.etree.ElementTree as ET, re
 from discord.ext import commands, tasks
 from flask import Flask
 
@@ -10,6 +10,8 @@ threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080), daemon=True)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+OWNER_ID = 1545810202232885258
 
 DB = "media.json"
 def load():
@@ -28,13 +30,50 @@ def set_setting(guild_id, key, value):
     s[key] = value
     save(d)
 
+# --- PREMIUM SYSTEM - MEDIA ONLY, NO CONFLICT ---
+PREMIUM_FILE = "premium.json"
+def load_premium():
+    try:
+        with open(PREMIUM_FILE) as f: return json.load(f)
+    except: return {"users": [], "global_lock": False}
+def save_premium(d):
+    with open(PREMIUM_FILE, "w") as f: json.dump(d, f, indent=2)
+
+def is_premium(user_id):
+    if int(user_id) == OWNER_ID:
+        return True
+    d = load_premium()
+    return str(user_id) in d["users"]
+
+def is_owner(ctx):
+    return ctx.author.id == OWNER_ID
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     check_feeds.start()
 
-# --- YOUTUBE RSS - WORKS NOW, NO API KEY ---
-def get_latest_youtube(channel_id):
+# --- YOUTUBE: HANDLE -> CHANNEL ID RESOLVER ---
+def resolve_youtube_id(creator):
+    # If already UC... return as-is
+    if creator.startswith("UC"):
+        return creator
+    # If @handle, try to resolve via YouTube page
+    if creator.startswith("@"):
+        try:
+            url = f"https://www.youtube.com/{creator}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="ignore")
+            m = re.search(r'"channelId":"(UC[^"]+)"', html)
+            if m: return m.group(1)
+            m2 = re.search(r'channel/(UC[^"/\s]+)', html)
+            if m2: return m2.group(1)
+        except Exception as e:
+            print("Resolve error", e)
+    return creator
+
+def get_latest_youtube(creator):
+    channel_id = resolve_youtube_id(creator)
     try:
         url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -58,7 +97,7 @@ async def send_help(ctx):
     e.add_field(name="📥 Core", value="`!media add youtube @NOTGAMERSHUB #helo`\n`!media add twitch shroud #live`\n`!media add tiktok @user #tiktok`\n`!media add instagram @user #insta`\n`!media add x @user #tweets`\n`!media add kick shroud #kick`\n`!media list`\n`!media remove youtube @NOTGAMERSHUB`", inline=False)
     e.add_field(name="🛠️ Management", value="`!media test youtube`\n`!media pause` / `!media resume`\n`!media check` - Check NOW\n`!media stats`\n`!media clear`", inline=False)
     e.add_field(name="🎨 Customization", value="`!media ping @Role`\n`!media message NEW BANGER 🔥`\n`!media thumbnail on/off`\n`!media channel #new-channel`\n`!media filter shorts/videos/all`", inline=False)
-    e.add_field(name="👑 Premium", value="`!media instant` - No 15 min delay\n`!media clips` - Twitch clips\n`!media schedule 18:00`", inline=False)
+    e.add_field(name="👑 Premium", value="`!media instant` - No 15 min delay [PREMIUM]\n`!media clips` - Twitch clips [PREMIUM]\n`!media schedule 18:00` [PREMIUM]\n`!media premium` - See who has premium\n`!media unlock @user` - OWNER ONLY\n`!media lock @user` - OWNER ONLY", inline=False)
     e.add_field(name="🔍 Utility", value="`!media preview @NOTGAMERSHUB`\n`!media top`\n`!media help`", inline=False)
     e.set_footer(text="NEXUS MEDIA • ALL SOCIALS • FREE: 1 feed, 15 min delay | PREMIUM: Unlimited, instant")
     await ctx.send(embed=e)
@@ -76,11 +115,45 @@ async def media(ctx, *args):
     d = load()
     gid = str(ctx.guild.id)
 
+    # --- PREMIUM COMMANDS - USE !media unlock / !media lock TO AVOID CONFLICT ---
+    if sub == "premium" or sub == "premiumlist":
+        p = load_premium()
+        if not p["users"]:
+            await ctx.send("📋 No premium users yet.\nUse `!media unlock @user` (Owner only) to add one."); return
+        txt = "\n".join([f"• <@{u}>" for u in p["users"]])
+        await ctx.send(f"👑 **MEDIA Premium Users ({len(p['users'])}):**\n{txt}\nOwner: <@{OWNER_ID}> always has premium."); return
+
+    if sub == "unlock":
+        if not is_owner(ctx):
+            await ctx.send("❌ Only the OWNER can give MEDIA premium!"); return
+        if not ctx.message.mentions:
+            await ctx.send("Use: `!media unlock @user`"); return
+        member = ctx.message.mentions[0]
+        p = load_premium()
+        if str(member.id) not in p["users"]:
+            p["users"].append(str(member.id)); save_premium(p)
+        await ctx.send(f"✅ Unlocked 👑 {member.mention} now has MEDIA PREMIUM - Unlimited feeds, instant posts!"); return
+
+    if sub == "lock":
+        if not is_owner(ctx):
+            await ctx.send("❌ Only the OWNER can remove MEDIA premium!"); return
+        if not ctx.message.mentions:
+            await ctx.send("Use: `!media lock @user`"); return
+        member = ctx.message.mentions[0]
+        p = load_premium()
+        if str(member.id) in p["users"]:
+            p["users"].remove(str(member.id)); save_premium(p)
+        await ctx.send(f"🔒 Locked {member.mention} - Back to FREE: 1 feed, 15 min delay"); return
+
     if sub == "add" and len(args) >= 4:
         platform, creator = args[1].lower(), args[2]
         if platform not in ["youtube","twitch","tiktok","instagram","x","twitter","kick"]:
             await ctx.send("❌ Platform must be: youtube / twitch / tiktok / instagram / x / kick"); return
         if platform == "twitter": platform = "x"
+        # FREE LIMIT CHECK
+        my_feeds = [f for f in d["feeds"] if f["guild"] == gid]
+        if len(my_feeds) >= 1 and not is_premium(ctx.author.id):
+            await ctx.send("❌ FREE limit: 1 feed only!\nGet PREMIUM for unlimited feeds - ask owner for `!media unlock @you`"); return
         channel = ctx.message.channel_mentions[0] if ctx.message.channel_mentions else ctx.channel
         d["feeds"].append({"guild": gid, "platform": platform, "creator": creator, "channel_id": channel.id, "last_id": "", "thumbnail": True, "filter": "all"})
         save(d)
@@ -148,12 +221,18 @@ async def media(ctx, *args):
         save(d); await ctx.send(f"✅ Filter for {args[1]} set to `{args[2]}`"); return
 
     if sub == "instant":
+        if not is_premium(ctx.author.id):
+            await ctx.send("❌ You need MEDIA PREMIUM for instant posts!\nFREE = 15 min delay\nAsk owner for `!media unlock @you`"); return
         await ctx.send("⚡ **PREMIUM:** Instant posting enabled!"); set_setting(gid,"instant",True); return
 
     if sub == "clips":
+        if not is_premium(ctx.author.id):
+            await ctx.send("❌ PREMIUM only! Ask owner for `!media unlock @you`"); return
         await ctx.send("🎬 **PREMIUM:** Twitch Clips auto-post ON!"); return
 
     if sub == "schedule" and len(args)>=2:
+        if not is_premium(ctx.author.id):
+            await ctx.send("❌ PREMIUM only! Ask owner for `!media unlock @you`"); return
         await ctx.send(f"🕐 Scheduled check set to `{args[1]}`"); return
 
     if sub == "preview" and len(args)>=2:
@@ -185,9 +264,6 @@ async def check_once(test_channel=None):
                     e.set_footer(text="NEXUS MEDIA • YouTube")
                     await ch.send(embed=e)
                     posts = get_setting(f["guild"], "posts", 0); set_setting(f["guild"], "posts", posts+1)
-        else:
-            # Other platforms saved, but need API keys - we will wire Twitch/TikTok/Insta/X/Kick next step
-            pass
 
 @tasks.loop(minutes=15)
 async def check_feeds():
