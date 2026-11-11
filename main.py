@@ -37,30 +37,69 @@ def save(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-# ---------- YOUTUBE ----------
+# ---------- YOUTUBE - FIXED ----------
 def get_channel_id(handle):
-    url = f"https://www.youtube.com/{handle}"
-    html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-    m = re.search(r'"channelId":"(UC[\w-]+)"', html)
-    if m:
-        return m.group(1)
+    h = handle if handle.startswith("@") else f"@{handle}"
+    # FIX 1: Lemnos API - works on Render, not blocked like scraping
+    try:
+        r = requests.get(f"https://yt.lemnoslife.com/channels?handle={h}", timeout=10).json()
+        if r.get("items"):
+            return r["items"][0]["id"]
+    except Exception as e:
+        print("Lemnos channel fail:", e)
+    # Fallback: old scrape
+    try:
+        url = f"https://www.youtube.com/{h}"
+        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).text
+        m = re.search(r'"channelId":"(UC[\w-]+)"', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print("Scrape fail:", e)
     return None
+
+def parse_duration_iso(s):
+    # PT1M5S -> 65 seconds, PT45S -> 45
+    try:
+        m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', s or "")
+        if not m: return 9999
+        h, mi, sec = m.groups()
+        return int(h or 0)*3600 + int(mi or 0)*60 + int(sec or 0)
+    except:
+        return 9999
+
+def is_short_video(video_id):
+    # FIX 3: Check real duration via Lemnos, not link. Shorts = <= 60s
+    try:
+        r = requests.get(f"https://yt.lemnoslife.com/videos?part=contentDetails&id={video_id}", timeout=10).json()
+        if r.get("items"):
+            dur = r["items"][0].get("contentDetails", {}).get("duration", "")
+            secs = parse_duration_iso(dur)
+            print(f"Video {video_id} duration {dur} = {secs}s -> short={secs<=60}")
+            return secs <= 60
+    except Exception as e:
+        print("Short check fail:", e)
+    return False
 
 def get_latest_youtube(creator):
     handle = creator if creator.startswith("@") else f"@{creator}"
     cid = get_channel_id(handle)
     if not cid:
+        print(f"NO CHANNEL ID for {handle}")
         return None
     feed = feedparser.parse(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}")
     if not feed.entries:
+        print(f"NO ENTRIES for {cid}")
         return None
     e = feed.entries[0]
+    vid = e.yt_videoid
     return {
-        "id": e.yt_videoid,
+        "id": vid,
         "title": e.title,
         "link": e.link,
         "thumb": e.media_thumbnail[0]["url"] if hasattr(e, "media_thumbnail") else "",
         "author": e.author,
+        "is_short": is_short_video(vid),
     }
 
 # ---------- BOT EVENTS ----------
@@ -80,7 +119,7 @@ async def media_help(ctx):
     embed.add_field(name="Setup", value="`!media add youtube @handle #channel`\n`!media list`\n`!media remove <number>`", inline=False)
     embed.add_field(name="Filter", value="`!media filter youtube shorts` - Only Shorts\n`!media filter youtube videos` - Only Long Videos\n`!media filter youtube all` - Both", inline=False)
     embed.add_field(name="Premium", value="`!media premium`\n`!media unlock @user` (Owner Only)\n`!media lock @user` (Owner Only)", inline=False)
-    embed.add_field(name="Other", value="`!media check` - Check now\n`!media test #channel`\n`!media instant`\n`!media clips`\n`!media schedule 18:00`", inline=False)
+    embed.add_field(name="Other", value="`!media check` - Check now\n`!media debug @handle` - See what bot finds\n`!media test #channel`", inline=False)
     await ctx.send(embed=embed)
 
 @media.command(name="add")
@@ -110,7 +149,7 @@ async def media_list(ctx):
         return
     msg = "**Your Feeds:**\n"
     for i, f in enumerate(data["feeds"], 1):
-        msg += f"{i}. {f['platform'].upper()} `{f['creator']}` -> <#{f['channel']}> | Filter: `{f.get('filter','all')}`\n"
+        msg += f"{i}. {f['platform'].upper()} `{f['creator']}` -> <#{f['channel']}> | Filter: `{f.get('filter','all')}` | Last: `{f.get('last_id')}`\n"
     await ctx.send(msg)
 
 @media.command(name="remove")
@@ -176,7 +215,17 @@ async def media_test(ctx, channel: discord.TextChannel = None):
     ch = channel or ctx.channel
     await ch.send("✅ MEDIA test - Bot can post here!")
 
-# ---------- CHECK - FILTER FIX INSIDE ----------
+# NEW: Debug - see what bot actually finds
+@media.command(name="debug")
+async def media_debug(ctx, creator: str):
+    await ctx.send(f"🔍 Debugging `{creator}`...")
+    latest = get_latest_youtube(creator)
+    if not latest:
+        await ctx.send("❌ Could not fetch - Channel ID not found or no videos. Check Render logs.")
+        return
+    await ctx.send(f"✅ Found: **{latest['title']}**\nLink: {latest['link']}\nID: `{latest['id']}`\nIs Short: `{latest['is_short']}`")
+
+# ---------- CHECK - FIXED ----------
 async def send_post(feed, data):
     ch = bot.get_channel(feed["channel"])
     if not ch:
@@ -186,8 +235,8 @@ async def send_post(feed, data):
     embed.set_footer(text=f"{data['author']} just uploaded!")
     await ch.send(embed=embed)
 
-@tasks.loop(minutes=15)
-async def check_feeds():
+# FIX 2: Real function that does the work - loop just calls it
+async def check_once():
     data = load()
     for f in data["feeds"]:
         try:
@@ -198,30 +247,29 @@ async def check_feeds():
                 continue
             if latest["id"] == f.get("last_id"):
                 continue
-
-            # ===== FILTER CHECK - NEW FIX =====
-            is_short = "/shorts/" in latest["link"]
+            # FILTER CHECK - FIXED, uses is_short not link
             filt = f.get("filter", "all")
-            if filt == "shorts" and not is_short:
+            if filt == "shorts" and not latest.get("is_short"):
                 f["last_id"] = latest["id"]
                 continue
-            if filt == "videos" and is_short:
+            if filt == "videos" and latest.get("is_short"):
                 f["last_id"] = latest["id"]
                 continue
-            # ===== END FILTER CHECK =====
-
             await send_post(f, latest)
             f["last_id"] = latest["id"]
         except Exception as e:
             print(f"Error checking {f.get('creator')}: {e}")
     save(data)
 
+@tasks.loop(minutes=15)
+async def check_feeds():
+    await check_once()
+
 @media.command(name="check")
 async def media_check(ctx):
     await ctx.send("🔍 Checking feeds...")
-    await check_feeds()
-    await ctx.send("✅ Check done!")
+    await check_once()  # FIX 2: Call real function, not loop object
+    await ctx.send("✅ Check done! If nothing posted, latest was already seen or filtered out. Use `!media debug @handle` to see it.")
 
 keep_alive()
 bot.run(DISCORD_TOKEN)
-
